@@ -1,0 +1,417 @@
+// ==UserScript==
+// @name         104 VIP Resume Bunny Copy Button (Auto Avoid Down)
+// @namespace    https://vip.104.com.tw/
+// @version      1.7.1
+// @description  Bunny-only button (no ring/circle), status text on bunny, copies Name/Email/Mobile/ResumeCode, auto avoid overlap (down)
+// @match        https://vip.104.com.tw/search/SearchResumeMaster*
+// @match        https://vip.104.com.tw/apply/ApplyResume?*
+// @grant        GM_setClipboard
+// @run-at       document-idle
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  /**********************
+   * Config
+   **********************/
+  const CFG = {
+    waitTimeoutMs: 7000,
+    pollIntervalMs: 120,
+
+    btnTextIdle: '一鍵複製',
+    btnTextDone: '已複製 ✅',
+    resetToIdleAfterMs: 2000,
+
+    // 更靠右下角（預設貼邊距離）
+    edgeRightPx: 6,
+    edgeBottomPx: 6,
+
+    // ✅ 避讓時往「下」移多少（避免跟 104 右下角浮動客服重疊）
+    avoidShiftDownPx: 86,
+
+    // 右下角掃描區域（越小越不會誤判）
+    scanRightZonePx: 200,
+    scanBottomZonePx: 240,
+  };
+
+  /**********************
+   * Bunny Icon URL (RAW)
+   **********************/
+  const BUNNY_ICON_URL =
+    "https://raw.githubusercontent.com/HyEricJiang/104Icon/main/rabbit_icon_256.png";
+
+  /**********************
+   * Selectors (your provided)
+   **********************/
+  const SEL = {
+    name:  '#app > div:nth-child(1) > div:nth-child(3) > main > div.modal.contact-information-modal.modal-centered > div.modal-dialog.modal-dialog--md > div > div.modal-body > div > div > div:nth-child(1) > div',
+    email: '#app > div:nth-child(1) > div:nth-child(3) > main > div.modal.contact-information-modal.modal-centered > div.modal-dialog.modal-dialog--md > div > div.modal-body > div > div > div:nth-child(2) > div.col-10 > a',
+    phone: '#app > div:nth-child(1) > div:nth-child(3) > main > div.modal.contact-information-modal.modal-centered > div.modal-dialog.modal-dialog--md > div > div.modal-body > div > div > div:nth-child(3) > div.col-10 > div > a',
+
+    modalRoot: 'div.modal.contact-information-modal',
+    resumeCodeSpans: 'span.copy-content',
+    contactBtnIcon: 'i.vip-icon-contact',
+  };
+
+  /**********************
+   * Utils
+   **********************/
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const textOf = (el) => (el?.textContent || '').replace(/\s+/g, ' ').trim();
+  const attrOf = (el, name) => (el?.getAttribute?.(name) || '').trim();
+
+  async function waitForFn(fn, timeoutMs = CFG.waitTimeoutMs) {
+    const start = Date.now();
+    while (Date.now() - start <= timeoutMs) {
+      try {
+        const v = fn();
+        if (v) return v;
+      } catch (_) {}
+      await sleep(CFG.pollIntervalMs);
+    }
+    return null;
+  }
+
+  function tsvEscape(v) {
+    return String(v ?? '').replace(/\r?\n/g, ' ').trim();
+  }
+
+  function copyTSV(values) {
+    const line = values.map(tsvEscape).join('\t');
+    if (typeof GM_setClipboard === 'function') {
+      GM_setClipboard(line, { type: 'text', mimetype: 'text/plain' });
+    } else {
+      navigator.clipboard?.writeText?.(line).catch(() => {});
+    }
+    return line;
+  }
+
+  /**********************
+   * Button UI
+   **********************/
+  let btnEl = null;
+  let statusEl = null;
+  let working = false;
+  let resetTimer = null;
+
+  function mountButton() {
+    if (btnEl) return;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #__bunnyCopyBtn {
+        -webkit-tap-highlight-color: transparent !important;
+        outline: none !important;
+        box-shadow: none !important;
+        background-color: transparent !important;
+      }
+      #__bunnyCopyBtn:focus,
+      #__bunnyCopyBtn:focus-visible,
+      #__bunnyCopyBtn:active {
+        outline: none !important;
+        box-shadow: none !important;
+      }
+    `;
+    document.documentElement.appendChild(style);
+
+    btnEl = document.createElement('button');
+    btnEl.id = '__bunnyCopyBtn';
+    btnEl.type = 'button';
+
+    btnEl.style.cssText = `
+      position: fixed;
+      right: ${CFG.edgeRightPx}px;
+      bottom: ${CFG.edgeBottomPx}px;
+      z-index: 2147483647;
+
+      width: 84px;
+      height: 84px;
+      padding: 0;
+      border: 0;
+      margin: 0;
+
+      background: transparent;
+      background-image: url("${BUNNY_ICON_URL}");
+      background-size: contain;
+      background-repeat: no-repeat;
+      background-position: center;
+
+      cursor: pointer;
+      user-select: none;
+
+      overflow: visible;
+      touch-action: manipulation;
+      transform: translateZ(0);
+    `;
+
+    statusEl = document.createElement('div');
+    statusEl.textContent = CFG.btnTextIdle;
+    statusEl.style.cssText = `
+      position: absolute;
+      left: 50%;
+      bottom: 8px;
+      transform: translateX(-50%);
+
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      line-height: 1.2;
+
+      color: #222;
+      text-shadow:
+        0 1px 0 rgba(255,255,255,0.85),
+        0 0 6px rgba(255,255,255,0.65);
+
+      pointer-events: none;
+      white-space: nowrap;
+    `;
+
+    btnEl.appendChild(statusEl);
+    btnEl.addEventListener('click', runCopy, { passive: true });
+    document.documentElement.appendChild(btnEl);
+
+    setTimeout(autoAvoidOverlap, 600);
+    window.addEventListener('resize', () => setTimeout(autoAvoidOverlap, 300));
+  }
+
+  function setStatus(text) {
+    if (statusEl) statusEl.textContent = text;
+  }
+
+  function setWorkingUI(isWorking) {
+    if (!btnEl) return;
+    btnEl.style.opacity = isWorking ? '0.85' : '1';
+    btnEl.style.pointerEvents = isWorking ? 'none' : 'auto';
+  }
+
+  function scheduleResetToIdle() {
+    clearTimeout(resetTimer);
+    resetTimer = setTimeout(() => {
+      setStatus(CFG.btnTextIdle);
+      setWorkingUI(false);
+      working = false;
+      setTimeout(autoAvoidOverlap, 50);
+    }, CFG.resetToIdleAfterMs);
+  }
+
+  /**********************
+   * ✅ Auto avoid overlap (DOWN)
+   **********************/
+  function rectOverlap(a, b) {
+    return !(a.right < b.left || a.left > b.right || a.bottom < b.top || a.top > b.bottom);
+  }
+
+  function autoAvoidOverlap() {
+    const bunny = document.getElementById('__bunnyCopyBtn');
+    if (!bunny) return;
+
+    // 先貼邊
+    bunny.style.right = `${CFG.edgeRightPx}px`;
+    bunny.style.bottom = `${CFG.edgeBottomPx}px`;
+
+    // 取得貼邊後位置
+    const bunnyRect = bunny.getBoundingClientRect();
+
+    const candidates = Array.from(document.querySelectorAll('body *')).filter(el => {
+      if (el === bunny) return false;
+      const s = getComputedStyle(el);
+      if (s.position !== 'fixed') return false;
+      if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity || '1') === 0) return false;
+
+      const r = el.getBoundingClientRect();
+      if (r.width < 18 || r.height < 18) return false;
+
+      const inRightZone = r.right > window.innerWidth - CFG.scanRightZonePx;
+      const inBottomZone = r.bottom > window.innerHeight - CFG.scanBottomZonePx;
+      return inRightZone && inBottomZone;
+    });
+
+    // 有重疊就往下避讓（但要避免超出螢幕）
+    for (const el of candidates) {
+      const r = el.getBoundingClientRect();
+      if (rectOverlap(bunnyRect, r)) {
+        const bunnyH = bunnyRect.height || 84;
+
+        // 計算新的 bottom：貼邊 + 下移
+        let newBottom = CFG.edgeBottomPx - CFG.avoidShiftDownPx;
+
+        // bottom 是 CSS 的距離底部；要「往下」其實是把 bottom 變小甚至變負
+        // 但我們不要跑出螢幕，所以限制最小值：
+        // 允許最多貼到螢幕下緣 0px（不出界）
+        newBottom = Math.max(0, newBottom);
+
+        bunny.style.bottom = `${newBottom}px`;
+        break;
+      }
+    }
+  }
+
+  /**********************
+   * Finders
+   **********************/
+  function getResumeCode() {
+    const spans = Array.from(document.querySelectorAll(SEL.resumeCodeSpans));
+    const texts = spans.map(textOf).filter(Boolean);
+
+    let pick = texts.find(t => /^\d{6,12}$/.test(t.replace(/\s+/g, '')));
+    if (pick) return pick.replace(/\s+/g, '').trim();
+
+    pick = texts.find(t => /^[A-Za-z0-9_-]{4,20}$/.test(t.replace(/\s+/g, '')));
+    if (pick) return pick.replace(/\s+/g, '').trim();
+
+    return (texts[0] || '').trim();
+  }
+
+  function findContactButton() {
+    const icon = document.querySelector(SEL.contactBtnIcon);
+    if (icon) {
+      const btn = icon.closest('button');
+      if (btn) return btn;
+    }
+    const buttons = Array.from(document.querySelectorAll('button'));
+    return buttons.find(b => /聯繫方式/.test(textOf(b))) || null;
+  }
+
+  function readName() {
+    return textOf(document.querySelector(SEL.name));
+  }
+
+  function readEmail() {
+    const el = document.querySelector(SEL.email);
+    const href = attrOf(el, 'href');
+    const fromHref = href.replace(/^mailto:/i, '').trim();
+    return fromHref || textOf(el);
+  }
+
+  function readPhone() {
+    const el = document.querySelector(SEL.phone);
+    const href = attrOf(el, 'href');
+    const fromHref = href.replace(/^tel:/i, '').trim();
+    return fromHref || textOf(el);
+  }
+
+  /**********************
+   * Close modal (robust)
+   **********************/
+  function pressEsc() {
+    document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true
+    }));
+  }
+
+  function tryClick(el) {
+    if (!el) return false;
+    try { el.click(); return true; } catch { return false; }
+  }
+
+  function findCloseCandidateInModal(modal) {
+    if (!modal) return null;
+
+    const q1 = modal.querySelector(
+      'button[aria-label*="關閉"],button[aria-label*="Close"],button[title*="關閉"],button[title*="Close"],button[data-dismiss],button[data-bs-dismiss],button.close'
+    );
+    if (q1) return q1;
+
+    const candidates = Array.from(modal.querySelectorAll('button,a,div,i,span'));
+    const byText = candidates.find(el => {
+      const t = textOf(el);
+      return t === '×' || t === '✕' || t === 'X';
+    });
+    if (byText) return byText.closest('button,a,div') || byText;
+
+    const byClass = candidates.find(el => /\b(close|modal-close|btn-close|icon-close)\b/i.test(el.className || ''));
+    if (byClass) return byClass.closest('button,a,div') || byClass;
+
+    return null;
+  }
+
+  function clickCloseByCoordinate(modal) {
+    if (!modal) return false;
+    const rect = modal.getBoundingClientRect();
+    const x = Math.min(window.innerWidth - 2, rect.right - 14);
+    const y = Math.max(2, rect.top + 14);
+
+    const target = document.elementFromPoint(x, y);
+    if (!target) return false;
+    const clickable = target.closest('button,a,div') || target;
+
+    try {
+      ['mousedown', 'mouseup', 'click'].forEach(type => {
+        clickable.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y }));
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function closeModalRobust() {
+    const modal = document.querySelector(SEL.modalRoot);
+    if (!modal) return;
+
+    const cand = findCloseCandidateInModal(modal);
+    if (tryClick(cand)) return;
+
+    if (clickCloseByCoordinate(modal)) return;
+
+    pressEsc();
+  }
+
+  /**********************
+   * Main flow
+   **********************/
+  async function runCopy() {
+    if (working) return;
+
+    working = true;
+    clearTimeout(resetTimer);
+    setWorkingUI(true);
+
+    try {
+      setStatus('抓履歷代碼…');
+      const resumeCode = getResumeCode();
+
+      const contactBtn = findContactButton();
+      if (!contactBtn) {
+        setStatus('找不到聯繫方式');
+        scheduleResetToIdle();
+        return;
+      }
+
+      setStatus('開啟聯繫方式…');
+      contactBtn.click();
+
+      const ready = await waitForFn(() => {
+        return document.querySelector(SEL.name) || document.querySelector(SEL.email) || document.querySelector(SEL.phone);
+      });
+
+      if (!ready) {
+        setStatus('資料未出現');
+        scheduleResetToIdle();
+        return;
+      }
+
+      setStatus('讀取資料…');
+      const name = readName();
+      const email = readEmail();
+      const phone = readPhone();
+
+      setStatus('關閉視窗…');
+      await closeModalRobust();
+
+      // Copy order: 姓名 > 信箱 > 手機 > 履歷代碼
+      copyTSV([name, email, phone, resumeCode]);
+
+      setStatus(CFG.btnTextDone);
+      scheduleResetToIdle();
+
+    } catch (e) {
+      console.error('[104Copy] error', e);
+      setStatus('錯誤');
+      scheduleResetToIdle();
+    }
+  }
+
+  mountButton();
+})();
